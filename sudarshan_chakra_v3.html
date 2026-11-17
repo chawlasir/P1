@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sudarshan Chakra</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:sans-serif; }
+  #wrap { position:relative; width:100vw; height:100vh; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  video { opacity:.4; }
+  #msg { position:absolute; left:0; right:0; bottom:18px; text-align:center; color:#fff; font-size:15px; z-index:5; text-shadow:0 0 6px #000; padding:0 12px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="msg">कैमरा चालू हो रहा है… अनुमति (Allow) दें</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const msg = document.getElementById('msg');
+let W = 0, H = 0;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+resize(); addEventListener('resize', resize);
+
+// ---------- settings ----------
+const HOLD_MS = 120;          // उँगली/हाथ हटने पर इतने ms बाद चक्र एकदम गायब
+const TILT = 0.3;             // चक्र कितना "लेटा हुआ" दिखे
+const BLAST_GROWTH = 1.3;     // दोनों खुले हाथ आगे धक्का -> ब्लास्ट
+const BLAST_COOLDOWN = 1200;
+const CIRCLE_SWEEP = 1.7 * Math.PI;   // उँगली से कम से कम इतना (~300°) गोल घुमाना
+const STOP_MS = 220;          // उँगली इतनी देर रुके तो चक्र उड़ेगा
+const FLIGHT_MS = 1800;       // चक्र का एक राउंड कितनी देर का
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+function toScreen(lm) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh);
+  const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  return { x: lm.x * vw * s + ox, y: lm.y * vh * s + oy };
+}
+
+function fingerState(lm) {
+  const w = lm[0];
+  const ext = [];
+  [[8, 6], [12, 10], [16, 14], [20, 18]].forEach(([tip, pip]) => {
+    if (dist(lm[tip], w) > dist(lm[pip], w) * 1.12) ext.push(tip);
+  });
+  const handLen = dist(lm[0], lm[9]);
+  const thumb = dist(lm[4], lm[17]) > dist(lm[3], lm[17]) * 1.12 && dist(lm[4], lm[5]) > handLen * 0.5;
+  return { ext, thumb };
+}
+
+// ---------- state ----------
+let state = null, lastMode = null;
+let sparks = [];
+const blastSparks = [];       // ब्लास्ट + उड़ान की चिंगारियाँ (mode बदलने पर भी नहीं मिटतीं)
+const blasts = [];
+const smooth = [null, null];
+const tipSmooth = {};
+let sizeHist = [];
+let blastCooldownUntil = 0, energySuppressUntil = 0;
+let lastMid = { x: 0, y: 0 };
+
+// सिंगल-फिंगर चक्र + गोल घुमाने का जेस्चर
+let chosenKey = null;
+let fingerPos = { x: 0, y: 0 }, fingerSeenAt = 0;
+let fingerTrail = [];
+let circleArmed = false, circleArmedAt = 0, circleInfo = null;
+let launchLockUntil = 0;
+let flight = null;
+
+function smoothTip(key, x, y) {
+  const s = tipSmooth[key];
+  if (!s) tipSmooth[key] = { x, y };
+  else { s.x += (x - s.x) * 0.55; s.y += (y - s.y) * 0.55; }
+  return { x: tipSmooth[key].x, y: tipSmooth[key].y };
+}
+
+// ---------- गोल घुमाने की पहचान ----------
+function analyzeCircle(pts, size) {
+  if (pts.length < 8) return null;
+  let cx = 0, cy = 0;
+  pts.forEach(p => { cx += p.x; cy += p.y; });
+  cx /= pts.length; cy /= pts.length;
+  let sweep = 0, rSum = 0, prev = null;
+  pts.forEach(p => {
+    const a = Math.atan2(p.y - cy, p.x - cx);
+    rSum += Math.hypot(p.x - cx, p.y - cy);
+    if (prev !== null) {
+      let d = a - prev;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      sweep += d;
+    }
+    prev = a;
+  });
+  const avgR = rSum / pts.length;
+  if (Math.abs(sweep) >= CIRCLE_SWEEP && avgR >= Math.max(20, size * 0.18)) {
+    return { cx, cy, avgR, dir: Math.sign(sweep) };
+  }
+  return null;
+}
+
+function trackCircle(p, size, now) {
+  fingerTrail.push({ t: now, x: p.x, y: p.y });
+  while (fingerTrail.length && now - fingerTrail[0].t > 1800) fingerTrail.shift();
+  if (now < launchLockUntil) return;
+
+  const c = analyzeCircle(fingerTrail, size);
+  if (c) { circleInfo = c; circleArmed = true; circleArmedAt = now; }
+  if (!circleArmed) return;
+  if (now - circleArmedAt > 1500) { circleArmed = false; return; }
+
+  // उँगली रुकी या नहीं?
+  const recent = fingerTrail.filter(q => now - q.t <= 250);
+  if (recent.length >= 3 && now - recent[0].t >= STOP_MS - 20) {
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    recent.forEach(q => { x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y); });
+    if (Math.max(x1 - x0, y1 - y0) < Math.max(10, size * 0.07)) launchChakra(p, size, now);
+  }
+}
+
+// ---------- चक्र की उड़ान ----------
+function launchChakra(p, size, now) {
+  const R = clamp(size * 0.62, 26, 140);
+  const launch = { x: p.x, y: p.y - R * 0.12 };        // चक्र का मौजूदा केंद्र
+  const ci = circleInfo;
+  let vx = ci.cx - launch.x, vy = ci.cy - launch.y;
+  const len = Math.hypot(vx, vy);
+  if (len < 12) { vx = 0; vy = -1; } else { vx /= len; vy /= len; }
+  const Rorb = clamp(ci.avgR * 1.1, 55, Math.min(W, H) * 0.42);
+  const center = { x: launch.x + vx * Rorb, y: launch.y + vy * Rorb };   // कक्षा (orbit) उँगली से होकर गुज़रती है
+  flight = {
+    t0: now, launch, fingerAtLaunch: { x: p.x, y: p.y },
+    center, Rorb, R,
+    th0: Math.atan2(launch.y - center.y, launch.x - center.x),
+    dir: ci.dir || 1,
+    off: { x: 0, y: 0 },
+    trail: []
+  };
+  puff(launch.x, launch.y, 26);
+  fingerTrail = []; circleArmed = false; launchLockUntil = now + 800;
+}
+
+function puff(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 7;
+    blastSparks.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp * 0.8,
+      life: 1, decay: 0.03 + Math.random() * 0.03, w: 2,
+      color: [255, 190 + Math.random() * 50, 70]
+    });
+  }
+}
+
+// ---------- MediaPipe ----------
+const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+hands.onResults(res => {
+  const list = res.multiHandLandmarks || [];
+  const now = performance.now();
+
+  const infos = list.map((lm, hi) => {
+    const fs = fingerState(lm);
+    const ids = fs.ext.slice();
+    if (fs.thumb) ids.push(4);
+    let x = 0, y = 0;
+    [0, 5, 9, 13, 17].forEach(i => { x += lm[i].x; y += lm[i].y; });
+    return {
+      hi,
+      palm: toScreen({ x: x / 5, y: y / 5 }),
+      size: dist(toScreen(lm[0]), toScreen(lm[9])),
+      open: fs.ext.length === 4,
+      tips: ids.map(id => ({ id, ...toScreen(lm[id]) }))
+    };
+  });
+
+  const used = new Set();
+
+  if (infos.length >= 2 && infos[0].open && infos[1].open) {
+    // ===== दोनों हाथ खुले: एनर्जी + आगे धक्का = ब्लास्ट =====
+    chosenKey = null; fingerTrail = []; circleArmed = false;
+    const two = infos.slice(0, 2).sort((a, b) => a.palm.x - b.palm.x);
+    two.forEach((h, i) => {
+      if (!smooth[i]) smooth[i] = { x: h.palm.x, y: h.palm.y };
+      smooth[i].x += (h.palm.x - smooth[i].x) * 0.6;
+      smooth[i].y += (h.palm.y - smooth[i].y) * 0.6;
+    });
+    const size = (two[0].size + two[1].size) / 2;
+    state = { mode: 'energy', a: { ...smooth[0] }, b: { ...smooth[1] }, size, t: now };
+    lastMid = { x: (smooth[0].x + smooth[1].x) / 2, y: (smooth[0].y + smooth[1].y) / 2 };
+
+    sizeHist.push({ t: now, s: size });
+    while (sizeHist.length && now - sizeHist[0].t > 450) sizeHist.shift();
+    if (sizeHist.length >= 3) {
+      const minS = Math.min(...sizeHist.map(h => h.s));
+      if (size / minS > BLAST_GROWTH && now > blastCooldownUntil) {
+        triggerBlast(lastMid.x, lastMid.y);
+        sizeHist = [];
+      }
+    }
+    msg.textContent = '🙌 दोनों हाथ खुले — एनर्जी! अब हाथ आगे की तरफ़ धक्का दें 💥';
+  } else {
+    sizeHist = [];
+    smooth[0] = smooth[1] = null;
+
+    // ===== सिर्फ़ एक उँगली पर चक्र =====
+    const cand = [];
+    infos.forEach(h => {
+      if (h.open) return;
+      h.tips.forEach(tp => cand.push({ key: h.hi + '-' + tp.id, id: tp.id, x: tp.x, y: tp.y, size: h.size }));
+    });
+
+    if (cand.length) {
+      const PRI = [8, 12, 16, 20, 4];             // इंडेक्स > मिडिल > रिंग > पिंकी > अंगूठा
+      let pick = cand.find(c => c.key === chosenKey);   // पहले वाली उँगली पर टिके रहें (कूदे नहीं)
+      if (!pick) {
+        cand.sort((a, b) => PRI.indexOf(a.id) - PRI.indexOf(b.id));
+        pick = cand[0];
+      }
+      if (pick.key !== chosenKey) { chosenKey = pick.key; fingerTrail = []; circleArmed = false; }
+      used.add(pick.key);
+      const p = smoothTip(pick.key, pick.x, pick.y);
+      fingerPos = { x: p.x, y: p.y };
+      fingerSeenAt = now;
+      state = { mode: 'chakra', tip: { x: p.x, y: p.y }, size: pick.size, t: now };
+
+      if (!flight) trackCircle(p, pick.size, now); else { fingerTrail = []; circleArmed = false; }
+      msg.textContent = flight ? '🌀 चक्र एक राउंड लगा रहा है…'
+        : circleArmed ? '⭕ गोला पूरा — अब उँगली रोकें'
+        : '☝️ उँगली से गोल घुमाकर रोकें — चक्र एक राउंड लगाएगा';
+    } else {
+      chosenKey = null; fingerTrail = []; circleArmed = false;
+      msg.textContent = infos.length
+        ? 'कोई एक उँगली उठाएँ, या दोनों हाथ खोलकर लाएँ'
+        : 'उँगली या हाथ कैमरे के सामने लाएँ  (स्क्रीन टैप = ब्लास्ट टेस्ट)';
+    }
+  }
+  Object.keys(tipSmooth).forEach(k => { if (!used.has(k)) delete tipSmooth[k]; });
+});
+
+new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 1280, height: 720
+}).start().catch(e => { msg.textContent = 'कैमरा नहीं खुला: ' + e.message; });
+
+document.addEventListener('pointerdown', () => triggerBlast(W / 2, H / 2));
+document.addEventListener('keydown', e => { if (e.code === 'Space') triggerBlast(W / 2, H / 2); });
+
+// =====================================================
+//                    सुदर्शन चक्र (horizontal)
+// =====================================================
+function chakraDisc(R, t, top) {
+  const N = 24, step = Math.PI * 2 / N;
+
+  ctx.save();
+  ctx.rotate(t * 9);
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const a0 = i * step;
+    if (i === 0) ctx.moveTo(Math.cos(a0) * R * 0.82, Math.sin(a0) * R * 0.82);
+    ctx.lineTo(Math.cos(a0 + step * 0.45) * R, Math.sin(a0 + step * 0.45) * R);
+    ctx.lineTo(Math.cos(a0 + step) * R * 0.82, Math.sin(a0 + step) * R * 0.82);
+  }
+  ctx.closePath();
+  ctx.moveTo(R * 0.6, 0);
+  ctx.arc(0, 0, R * 0.6, 0, Math.PI * 2);
+
+  const g = ctx.createRadialGradient(0, 0, R * 0.45, 0, 0, R);
+  if (top) { g.addColorStop(0, '#fff3b0'); g.addColorStop(0.6, '#ffb81f'); g.addColorStop(1, '#ff6a00'); }
+  else     { g.addColorStop(0, '#c77a00'); g.addColorStop(1, '#7a3500'); }
+  ctx.fillStyle = g;
+  if (top) { ctx.shadowColor = '#ff9a1a'; ctx.shadowBlur = 22; }
+  ctx.fill('evenodd');
+  ctx.shadowBlur = 0;
+  if (top) {
+    ctx.lineWidth = Math.max(1.5, R * 0.025);
+    ctx.strokeStyle = '#fff8d0';
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  if (!top) return;
+
+  ctx.save();
+  ctx.rotate(-t * 6);
+  ctx.strokeStyle = '#ffd24a';
+  ctx.shadowColor = '#ffae00';
+  ctx.shadowBlur = 14;
+  ctx.lineWidth = R * 0.07;
+  ctx.beginPath(); ctx.arc(0, 0, R * 0.56, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = R * 0.04;
+  ctx.beginPath(); ctx.arc(0, 0, R * 0.3, 0, Math.PI * 2); ctx.stroke();
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * R * 0.3, Math.sin(a) * R * 0.3);
+    ctx.lineTo(Math.cos(a) * R * 0.56, Math.sin(a) * R * 0.56);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  ctx.globalCompositeOperation = 'lighter';
+  const c = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.22);
+  c.addColorStop(0, 'rgba(255,255,255,1)');
+  c.addColorStop(0.5, 'rgba(255,220,100,0.8)');
+  c.addColorStop(1, 'rgba(255,150,0,0)');
+  ctx.fillStyle = c;
+  ctx.beginPath(); ctx.arc(0, 0, R * 0.22, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawChakra(cx, cy, R, t, tipGlow) {
+  const th = R * 0.05;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(1, TILT);
+  ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(0, 0, R * 0.3, 0, 0, R * 1.9);
+  g.addColorStop(0, 'rgba(255,190,60,0.55)');
+  g.addColorStop(1, 'rgba(255,120,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, R * 1.9, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  for (let L = 3; L >= 0; L--) {
+    ctx.save();
+    ctx.translate(cx, cy + L * th * 0.7);
+    ctx.scale(1, TILT);
+    ctx.globalAlpha = L === 0 ? 1 : 0.6;
+    chakraDisc(R, t, L === 0);
+    ctx.restore();
+  }
+
+  if (tipGlow) {   // उँगली की नोक पर छोटी चमक
+    ctx.globalCompositeOperation = 'lighter';
+    const tg = ctx.createRadialGradient(cx, cy + R * 0.12, 0, cx, cy + R * 0.12, R * 0.18);
+    tg.addColorStop(0, 'rgba(255,240,180,0.9)');
+    tg.addColorStop(1, 'rgba(255,160,0,0)');
+    ctx.fillStyle = tg;
+    ctx.beginPath(); ctx.arc(cx, cy + R * 0.12, R * 0.18, 0, Math.PI * 2); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+// उड़ान: उँगली से निकलकर एक राउंड लगाना, फिर उँगली पर लौटना (उँगली न हो तो गायब)
+function updateFlight(now, time) {
+  if (!flight) return;
+  const f = flight;
+  const u = (now - f.t0) / FLIGHT_MS;
+  const present = now - fingerSeenAt < 200;           // अभी उँगली दिख रही है?
+  if (present) f.off = { x: fingerPos.x - f.fingerAtLaunch.x, y: fingerPos.y - f.fingerAtLaunch.y };
+
+  if (u >= 1) {
+    if (present) puff(fingerPos.x, fingerPos.y - f.R * 0.12, 14);   // उँगली पर लौट आया
+    else puff(f.launch.x + f.off.x, f.launch.y + f.off.y, 40);      // उँगली नहीं मिली -> गायब
+    flight = null;
+    return;
+  }
+
+  const e = u * u * (3 - 2 * u);
+  const ang = f.th0 + f.dir * Math.PI * 2 * e;
+  const w = u * u;                                     // आख़िर में लाइव उँगली की तरफ़ झुकाव
+  const x = f.center.x + Math.cos(ang) * f.Rorb + f.off.x * w;
+  const y = f.center.y + Math.sin(ang) * f.Rorb + f.off.y * w;
+  const Rf = f.R * (1 + 0.25 * Math.sin(Math.PI * u));
+
+  // चमकती पूँछ (trail)
+  f.trail.push({ x, y, t: now });
+  while (f.trail.length && now - f.trail[0].t > 500) f.trail.shift();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (let i = 1; i < f.trail.length; i++) {
+    const a = f.trail[i - 1], b = f.trail[i];
+    const al = Math.max(0, 1 - (now - b.t) / 500);
+    ctx.strokeStyle = `rgba(255,${150 + 60 * al | 0},40,${al * 0.7})`;
+    ctx.shadowColor = '#ff9a1a';
+    ctx.shadowBlur = 24;
+    ctx.lineWidth = Rf * 0.5 * al + 2;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalCompositeOperation = 'source-over';
+
+  drawChakra(x, y, Rf, time * 1.8, false);
+
+  for (let i = 0; i < 3; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 5;
+    blastSparks.push({
+      x: x + Math.cos(a) * Rf, y: y + Math.sin(a) * Rf * TILT,
+      vx: -Math.sin(a) * sp, vy: Math.cos(a) * sp * TILT,
+      life: 1, decay: 0.04 + Math.random() * 0.03, w: 2,
+      color: [255, 200 + Math.random() * 40, 80]
+    });
+  }
+}
+
+// =====================================================
+//                 दोनों हाथों के बीच एनर्जी
+// =====================================================
+function lightning(x1, y1, x2, y2, color, amp) {
+  const segs = 12;
+  const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len, ny = dx / len;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  for (let i = 1; i < segs; i++) {
+    const k = i / segs;
+    const off = (Math.random() - 0.5) * amp * Math.sin(k * Math.PI);
+    ctx.lineTo(x1 + dx * k + nx * off, y1 + dy * k + ny * off);
+  }
+  ctx.lineTo(x2, y2);
+  ctx.strokeStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 16;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+}
+
+function drawEnergy(st, time) {
+  const mx = (st.a.x + st.b.x) / 2, my = (st.a.y + st.b.y) / 2;
+  const d = dist(st.a, st.b);
+  const s = clamp(st.size / 120, 0.5, 2.2);
+  const r = clamp(d * 0.16, 22, 100) * (1 + Math.sin(time * 18) * 0.08);
+
+  ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(mx, my, 0, mx, my, r * 2.6);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.15, 'rgba(255,240,150,0.95)');
+  g.addColorStop(0.35, 'rgba(255,200,40,0.55)');
+  g.addColorStop(0.65, 'rgba(50,130,255,0.45)');
+  g.addColorStop(1, 'rgba(30,90,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(mx, my, r * 2.6, 0, Math.PI * 2); ctx.fill();
+
+  const amp = Math.max(20, d * 0.12);
+  lightning(st.a.x, st.a.y, mx, my, 'rgb(70,160,255)', amp);
+  lightning(st.b.x, st.b.y, mx, my, 'rgb(255,215,60)', amp);
+  lightning(st.a.x, st.a.y, mx, my, 'rgb(255,215,60)', amp * 0.6);
+  lightning(st.b.x, st.b.y, mx, my, 'rgb(70,160,255)', amp * 0.6);
+
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = (3 + Math.random() * 10) * s;
+    const blue = Math.random() < 0.5;
+    sparks.push({
+      x: mx, y: my, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      life: 1, decay: 0.02 + Math.random() * 0.035, w: 1 + Math.random() * 2.2,
+      color: blue ? [60, 150, 255] : [255, 215, 50]
+    });
+  }
+}
+
+// =====================================================
+//                       ब्लास्ट 💥
+// =====================================================
+const BLAST_COLORS = [[255,255,255],[255,220,90],[255,150,40],[80,160,255],[255,200,60],[120,190,255]];
+
+function triggerBlast(x, y) {
+  const now = performance.now();
+  blastCooldownUntil = now + BLAST_COOLDOWN;
+  energySuppressUntil = now + 350;
+  const maxR = Math.hypot(W, H) * 0.6;
+  const unit = Math.min(W, H) / 700;
+
+  const lines = [];
+  const lc = ['255,255,255', '255,220,120', '120,180,255'];
+  for (let i = 0; i < 80; i++) {
+    lines.push({ a: Math.random() * Math.PI * 2, k: 0.4 + Math.random() * 0.7,
+                 len: 0.2 + Math.random() * 0.6, w: 1 + Math.random() * 3,
+                 c: lc[Math.floor(Math.random() * lc.length)] });
+  }
+  blasts.push({ t0: now, x, y, maxR, lines });
+
+  for (let i = 0; i < 280; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = (8 + Math.random() * 34) * unit;
+    blastSparks.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      life: 1, decay: 0.012 + Math.random() * 0.02, w: 1.5 + Math.random() * 3.5,
+      color: BLAST_COLORS[Math.floor(Math.random() * BLAST_COLORS.length)]
+    });
+  }
+  sparks = [];
+}
+
+function drawBlasts(now) {
+  for (let i = blasts.length - 1; i >= 0; i--) {
+    const b = blasts[i];
+    const age = (now - b.t0) / 1000;
+    if (age > 1.6) { blasts.splice(i, 1); continue; }
+    ctx.globalCompositeOperation = 'lighter';
+
+    if (age < 0.4) {
+      const a = Math.pow(1 - age / 0.4, 2) * 0.7;
+      ctx.fillStyle = `rgba(255,245,220,${a})`;
+      ctx.fillRect(-40, -40, W + 80, H + 80);
+    }
+
+    if (age < 0.9) {
+      const p = age / 0.9;
+      const e = 1 - Math.pow(1 - Math.min(p * 1.6, 1), 3);
+      const r = e * b.maxR * 0.4 + 10, al = 1 - p;
+      const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, r);
+      g.addColorStop(0, `rgba(255,255,255,${al})`);
+      g.addColorStop(0.3, `rgba(255,215,80,${0.9 * al})`);
+      g.addColorStop(0.65, `rgba(255,120,30,${0.6 * al})`);
+      g.addColorStop(1, 'rgba(60,130,255,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(b.x, b.y, r, 0, Math.PI * 2); ctx.fill();
+    }
+
+    const rings = [[0, '255,220,90'], [0.06, '80,160,255'], [0.12, '255,140,40']];
+    rings.forEach(([delay, col]) => {
+      const p = (age - delay) / 0.9;
+      if (p <= 0 || p >= 1) return;
+      const e = 1 - Math.pow(1 - p, 3);
+      ctx.strokeStyle = `rgba(${col},${1 - p})`;
+      ctx.shadowColor = `rgb(${col})`;
+      ctx.shadowBlur = 30;
+      ctx.lineWidth = 2 + (1 - p) * 26;
+      ctx.beginPath(); ctx.arc(b.x, b.y, e * b.maxR, 0, Math.PI * 2); ctx.stroke();
+      ctx.shadowBlur = 0;
+    });
+
+    const pl = age / 0.9;
+    if (pl < 1) {
+      const e = 1 - Math.pow(1 - pl, 3);
+      b.lines.forEach(l => {
+        const r0 = e * b.maxR * l.k, len = (1 - pl) * l.len * b.maxR * 0.3;
+        ctx.strokeStyle = `rgba(${l.c},${(1 - pl) * 0.9})`;
+        ctx.lineWidth = l.w;
+        ctx.beginPath();
+        ctx.moveTo(b.x + Math.cos(l.a) * r0, b.y + Math.sin(l.a) * r0);
+        ctx.lineTo(b.x + Math.cos(l.a) * (r0 + len), b.y + Math.sin(l.a) * (r0 + len));
+        ctx.stroke();
+      });
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// =====================================================
+//                    स्पार्क्स (common)
+// =====================================================
+function drawSparks(arr) {
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const p = arr[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vx *= 0.97; p.vy *= 0.97;
+    p.life -= p.decay;
+    if (p.life <= 0) { arr.splice(i, 1); continue; }
+    const [r, g, b] = p.color;
+    ctx.strokeStyle = `rgba(${r},${g},${b},${p.life})`;
+    ctx.shadowColor = `rgb(${r},${g},${b})`;
+    ctx.shadowBlur = 10;
+    ctx.lineWidth = p.w * p.life + 0.4;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x - p.vx * 2, p.y - p.vy * 2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// =====================================================
+//                       main loop
+// =====================================================
+function loop() {
+  const now = performance.now(), time = now / 1000;
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+
+  let shake = 0;
+  blasts.forEach(b => { const a = (now - b.t0) / 1000; if (a < 0.3) shake = Math.max(shake, (1 - a / 0.3) * 16); });
+  if (shake) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+
+  // उँगली/हाथ हटते ही चक्र एकदम गायब
+  if (state && now - state.t > HOLD_MS) state = null;
+  const mode = state ? state.mode : null;
+  if (mode !== lastMode) { sparks = []; lastMode = mode; }
+
+  updateFlight(now, time);       // उड़ान चल रही हो तो उसे हाथ की ज़रूरत नहीं
+
+  if (state) {
+    if (state.mode === 'energy') {
+      if (now > energySuppressUntil) drawEnergy(state, time);
+    } else if (state.mode === 'chakra' && !flight) {
+      const R = clamp(state.size * 0.62, 26, 140);
+      const cx = state.tip.x, cy = state.tip.y - R * 0.12;     // उँगली की नोक पर टिका
+      drawChakra(cx, cy, R, time, true);
+      for (let i = 0; i < 2; i++) {
+        const a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 4;
+        sparks.push({
+          x: cx + Math.cos(a) * R, y: cy + Math.sin(a) * R * TILT,
+          vx: -Math.sin(a) * sp, vy: Math.cos(a) * sp * TILT,
+          life: 1, decay: 0.04 + Math.random() * 0.03, w: 2,
+          color: [255, 200 + Math.random() * 40, 80]
+        });
+      }
+      if (sparks.length > 600) sparks.splice(0, sparks.length - 600);
+    }
+    drawSparks(sparks);
+  }
+
+  drawBlasts(now);
+  drawSparks(blastSparks);
+
+  ctx.restore();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
